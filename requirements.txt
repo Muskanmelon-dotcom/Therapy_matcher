@@ -13,3 +13,4 @@ seaborn==0.13.2
 # ---- Optional but safe ----
 networkx==3.3
 requests==2.32.3
+openai
