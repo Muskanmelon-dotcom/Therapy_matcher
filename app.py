@@ -6,7 +6,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
 import json
-from openai import OpenAI
+
+# Make OpenAI optional
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 # ============================================================
 # 1️⃣  LOAD DATA (from repo, not upload)
@@ -48,6 +54,18 @@ def load_all_data():
 
 emb_df, civic_df, depmap_df, fda_df = load_all_data()
 
+# Get OpenAI API key from secrets
+openai_api_key = None
+use_llm = False
+
+if OPENAI_AVAILABLE:
+    try:
+        openai_api_key = st.secrets.get("OPENAI_API_KEY", None)
+        if openai_api_key:
+            use_llm = True
+    except:
+        pass
+
 # Debug info in sidebar
 with st.sidebar:
     st.success("✅ Data successfully loaded from repository.")
@@ -58,9 +76,17 @@ with st.sidebar:
         st.write(f"**FDA Drugs:** {len(fda_df)} drugs" if not fda_df.empty else "**FDA Drugs:** Not loaded")
     
     st.markdown("---")
-    st.subheader("🔑 OpenAI API Settings")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", help="Enter your OpenAI API key for LLM-generated rationales")
-    use_llm = st.checkbox("Enable LLM Rationales", value=False, help="Generate clinical explanations using GPT-4")
+    st.subheader("🤖 AI Settings")
+    
+    if OPENAI_AVAILABLE and openai_api_key:
+        st.success("✅ OpenAI API configured")
+        use_llm = st.checkbox("Enable LLM Rationales", value=False, help="Generate clinical explanations using GPT-4")
+    elif OPENAI_AVAILABLE:
+        st.warning("⚠️ OpenAI API key not found in secrets")
+        use_llm = False
+    else:
+        st.error("❌ OpenAI not installed")
+        use_llm = False
 
 # ============================================================
 # 2️⃣  LLM RATIONALE GENERATOR
@@ -68,7 +94,7 @@ with st.sidebar:
 
 def generate_rationale(drug, biomarkers, evidence_level, mechanism, targets, api_key):
     """Generate clinical rationale using OpenAI GPT-4"""
-    if not api_key:
+    if not OPENAI_AVAILABLE or not api_key:
         return None
     
     try:
@@ -108,7 +134,83 @@ Keep it professional, concise, and actionable."""
         return None
 
 # ============================================================
-# 3️⃣  ENHANCED THERAPY RECOMMENDER WITH CLINICAL CONTEXT
+# 3️⃣  RESULTS DISPLAY FUNCTION (DEFINED BEFORE USE)
+# ============================================================
+
+def display_results(results, query_name):
+    """Display results with enhanced formatting"""
+    
+    # Reorder columns for better display
+    display_cols = ["Label Status", "Drug", "Similarity"]
+    
+    if "Biomarker" in results.columns:
+        display_cols.append("Biomarker")
+    if "Evidence Level" in results.columns:
+        display_cols.append("Evidence Level")
+    if "AI Rationale" in results.columns:
+        display_cols.append("AI Rationale")
+    elif "CIViC Rationale" in results.columns:
+        display_cols.append("CIViC Rationale")
+    if "Mechanism" in results.columns:
+        display_cols.append("Mechanism")
+    if "Targets" in results.columns:
+        display_cols.append("Targets")
+    if "Cardiotoxicity" in results.columns:
+        display_cols.append("Cardiotoxicity")
+    if "Dermatotoxicity" in results.columns:
+        display_cols.append("Dermatotoxicity")
+    if "Source" in results.columns:
+        display_cols.append("Source")
+    
+    # Filter to only existing columns
+    display_cols = [col for col in display_cols if col in results.columns]
+    results_display = results[display_cols]
+    
+    # Display with custom column config
+    st.dataframe(
+        results_display,
+        use_container_width=True,
+        column_config={
+            "Label Status": st.column_config.TextColumn("Status", width="small"),
+            "Drug": st.column_config.TextColumn("Drug", width="medium"),
+            "Similarity": st.column_config.NumberColumn("Similarity", format="%.3f", width="small"),
+            "Evidence Level": st.column_config.TextColumn("Evidence", width="small"),
+            "AI Rationale": st.column_config.TextColumn("AI-Generated Rationale", width="large"),
+            "CIViC Rationale": st.column_config.TextColumn("Clinical Rationale", width="large"),
+            "Targets": st.column_config.TextColumn("Targets", width="medium"),
+            "Mechanism": st.column_config.TextColumn("Mechanism", width="medium"),
+            "Source": st.column_config.LinkColumn("Source", width="small"),
+        },
+        hide_index=True
+    )
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Drugs Found", len(results))
+    with col2:
+        avg_sim = results["Similarity"].mean()
+        st.metric("Avg Similarity", f"{avg_sim:.3f}")
+    with col3:
+        on_label = len(results[results["Label Status"].str.contains("On-Label", na=False)])
+        st.metric("On-Label Options", on_label)
+    with col4:
+        if "Evidence Level" in results.columns:
+            high_evidence = len(results[results["Evidence Level"].isin(["A", "B"])])
+            st.metric("High Evidence", high_evidence)
+    
+    # CSV Download
+    csv = results.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download Results as CSV",
+        csv,
+        f"{query_name}_recommendations.csv",
+        "text/csv",
+        key=f"download-{query_name}"
+    )
+
+# ============================================================
+# 4️⃣  ENHANCED THERAPY RECOMMENDER WITH CLINICAL CONTEXT
 # ============================================================
 
 def recommend_therapies_clinical(patient_profile, top_k=5, api_key=None, use_llm_rationales=False):
@@ -300,7 +402,7 @@ def recommend_therapies_simple(gene, variant, top_k=5, api_key=None, use_llm_rat
     return recommend_therapies_clinical(patient_profile, top_k, api_key, use_llm_rationales)
 
 # ============================================================
-# 4️⃣  STREAMLIT UI
+# 5️⃣  STREAMLIT UI
 # ============================================================
 
 st.title("🧬 TherapyMatcher — Precision Oncology Recommender")
@@ -393,79 +495,6 @@ else:  # Clinical Profile JSON mode
             st.error(f"❌ Invalid JSON format: {e}")
         except Exception as e:
             st.error(f"❌ Error processing profile: {e}")
-
-# ============================================================
-# 5️⃣  RESULTS DISPLAY FUNCTION
-# ============================================================
-
-def display_results(results, query_name):
-    """Display results with enhanced formatting"""
-    
-    # Reorder columns for better display
-    display_cols = ["Label Status", "Drug", "Similarity", "Biomarker"]
-    if "Evidence Level" in results.columns:
-        display_cols.append("Evidence Level")
-    if "AI Rationale" in results.columns:
-        display_cols.append("AI Rationale")
-    elif "CIViC Rationale" in results.columns:
-        display_cols.append("CIViC Rationale")
-    if "Mechanism" in results.columns:
-        display_cols.append("Mechanism")
-    if "Targets" in results.columns:
-        display_cols.append("Targets")
-    if "Cardiotoxicity" in results.columns:
-        display_cols.append("Cardiotoxicity")
-    if "Dermatotoxicity" in results.columns:
-        display_cols.append("Dermatotoxicity")
-    if "Source" in results.columns:
-        display_cols.append("Source")
-    
-    # Filter to only existing columns
-    display_cols = [col for col in display_cols if col in results.columns]
-    results_display = results[display_cols]
-    
-    # Display with custom column config
-    st.dataframe(
-        results_display,
-        use_container_width=True,
-        column_config={
-            "Label Status": st.column_config.TextColumn("Status", width="small"),
-            "Drug": st.column_config.TextColumn("Drug", width="medium"),
-            "Similarity": st.column_config.NumberColumn("Similarity", format="%.3f", width="small"),
-            "Evidence Level": st.column_config.TextColumn("Evidence", width="small"),
-            "AI Rationale": st.column_config.TextColumn("AI-Generated Rationale", width="large"),
-            "CIViC Rationale": st.column_config.TextColumn("Clinical Rationale", width="large"),
-            "Targets": st.column_config.TextColumn("Targets", width="medium"),
-            "Mechanism": st.column_config.TextColumn("Mechanism", width="medium"),
-            "Source": st.column_config.LinkColumn("Source", width="small"),
-        },
-        hide_index=True
-    )
-    
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Drugs Found", len(results))
-    with col2:
-        avg_sim = results["Similarity"].mean()
-        st.metric("Avg Similarity", f"{avg_sim:.3f}")
-    with col3:
-        on_label = len(results[results["Label Status"].str.contains("On-Label", na=False)])
-        st.metric("On-Label Options", on_label)
-    with col4:
-        if "Evidence Level" in results.columns:
-            high_evidence = len(results[results["Evidence Level"].isin(["A", "B"])])
-            st.metric("High Evidence", high_evidence)
-    
-    # CSV Download
-    csv = results.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download Results as CSV",
-        csv,
-        f"{query_name}_recommendations.csv",
-        "text/csv",
-        key=f"download-{query_name}"
-    )
 
 # ============================================================
 # 6️⃣  EMBEDDING VISUALIZATION
@@ -597,7 +626,6 @@ with st.expander("📖 About TherapyMatcher"):
     - Computational predictions, not clinical advice
     - Validate with current literature and guidelines
     - Evidence may have changed since data collection
-    - Requires OpenAI API key for LLM rationales
     
     **Developed for:** Evolved Boston 2025 Hackathon | Team 14: AI for Precision Medicine
     """)
