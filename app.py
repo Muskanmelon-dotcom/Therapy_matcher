@@ -5,6 +5,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
+import json
+from openai import OpenAI
 
 # ============================================================
 # 1️⃣  LOAD DATA (from repo, not upload)
@@ -54,48 +56,142 @@ with st.sidebar:
         st.write(f"**CIViC Evidence:** {len(civic_df)} records" if not civic_df.empty else "**CIViC Evidence:** Not loaded")
         st.write(f"**DepMap Compounds:** {len(depmap_df)} compounds" if not depmap_df.empty else "**DepMap Compounds:** Not loaded")
         st.write(f"**FDA Drugs:** {len(fda_df)} drugs" if not fda_df.empty else "**FDA Drugs:** Not loaded")
+    
+    st.markdown("---")
+    st.subheader("🔑 OpenAI API Settings")
+    openai_api_key = st.text_input("OpenAI API Key", type="password", help="Enter your OpenAI API key for LLM-generated rationales")
+    use_llm = st.checkbox("Enable LLM Rationales", value=False, help="Generate clinical explanations using GPT-4")
 
 # ============================================================
-# 2️⃣  THERAPY RECOMMENDER FUNCTION
+# 2️⃣  LLM RATIONALE GENERATOR
 # ============================================================
 
-def recommend_therapies(gene, variant, top_k=5):
+def generate_rationale(drug, biomarkers, evidence_level, mechanism, targets, api_key):
+    """Generate clinical rationale using OpenAI GPT-4"""
+    if not api_key:
+        return None
+    
+    try:
+        client = OpenAI(api_key=api_key)
+        
+        biomarker_str = ", ".join([f"{k}: {v}" for k, v in biomarkers.items() if v])
+        
+        prompt = f"""You are an oncology clinical decision support system. Generate a concise 2-3 sentence clinical rationale for recommending this therapy.
+
+Drug: {drug}
+Patient Biomarkers: {biomarker_str}
+Evidence Level: {evidence_level if pd.notna(evidence_level) else 'Not specified'}
+Mechanism: {mechanism if pd.notna(mechanism) else 'Not specified'}
+Targets: {targets if pd.notna(targets) else 'Not specified'}
+
+Provide a clear, evidence-based rationale that an oncologist would find helpful. Focus on:
+1. Why this drug matches the biomarker profile
+2. The strength of clinical evidence
+3. Any relevant clinical considerations
+
+Keep it professional, concise, and actionable."""
+
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert oncology clinical decision support assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.3
+        )
+        
+        return response.choices[0].message.content.strip()
+    
+    except Exception as e:
+        st.warning(f"LLM rationale generation failed: {e}")
+        return None
+
+# ============================================================
+# 3️⃣  ENHANCED THERAPY RECOMMENDER WITH CLINICAL CONTEXT
+# ============================================================
+
+def recommend_therapies_clinical(patient_profile, top_k=5, api_key=None, use_llm_rationales=False):
+    """
+    Recommend therapies based on full clinical profile
+    patient_profile: dict with diagnosis, line_of_therapy, biomarkers, comorbidities, prior_therapies
+    """
     if emb_df.empty:
         st.error("Embeddings not loaded.")
         return None
-
-    node = f"{gene.upper()}_{variant}"
-    if node not in emb_df.index:
-        st.warning(f"Variant node {node} not found in embeddings.")
-        return None
-
-    # Compute cosine similarity between variant node and all drug nodes
-    v = emb_df.loc[node].values.reshape(1, -1)
-    drug_nodes = [n for n in emb_df.index if any(x in n.lower() for x in ["ib", "inib", "mab", "nib", "tib", "raf", "met", "tinib"])]
     
-    if len(drug_nodes) == 0:
-        st.warning("No drug nodes found in embeddings.")
+    biomarkers = patient_profile.get("biomarkers", {})
+    line_of_therapy = patient_profile.get("line_of_therapy", "1L")
+    diagnosis = patient_profile.get("diagnosis", "")
+    
+    # Find all positive biomarkers
+    positive_biomarkers = {k: v for k, v in biomarkers.items() if v and v != "false" and v != False}
+    
+    if not positive_biomarkers:
+        st.warning("No positive biomarkers found in patient profile.")
         return None
     
-    drug_vectors = emb_df.loc[drug_nodes]
-    sims = cosine_similarity(v, drug_vectors)[0]
-    top_idx = np.argsort(sims)[::-1][:top_k]
-
-    results = pd.DataFrame({
-        "Drug": [drug_nodes[i] for i in top_idx],
-        "Similarity": [round(float(sims[i]), 3) for i in top_idx]
-    })
-
+    # Try each biomarker and collect all recommendations
+    all_results = []
+    
+    for gene, variant in positive_biomarkers.items():
+        # Handle different variant formats
+        if isinstance(variant, str) and variant.lower() in ['true', 'positive', 'present']:
+            node = f"{gene.upper()}"
+        else:
+            node = f"{gene.upper()}_{variant}"
+        
+        # Fallback logic
+        if node not in emb_df.index:
+            gene_node = gene.upper()
+            if gene_node in emb_df.index:
+                node = gene_node
+            else:
+                continue
+        
+        # Compute similarities
+        v = emb_df.loc[node].values.reshape(1, -1)
+        drug_nodes = [n for n in emb_df.index if any(x in n.lower() for x in ["ib", "inib", "mab", "nib", "tib", "raf", "met", "tinib"])]
+        
+        if len(drug_nodes) == 0:
+            continue
+        
+        drug_vectors = emb_df.loc[drug_nodes]
+        sims = cosine_similarity(v, drug_vectors)[0]
+        top_idx = np.argsort(sims)[::-1][:top_k*2]  # Get more candidates
+        
+        for idx in top_idx:
+            all_results.append({
+                "Drug": drug_nodes[idx],
+                "Similarity": round(float(sims[idx]), 3),
+                "Biomarker": f"{gene}_{variant}" if not isinstance(variant, bool) else gene
+            })
+    
+    if not all_results:
+        st.warning("No drug matches found for the biomarker profile.")
+        return None
+    
+    # Convert to DataFrame and deduplicate
+    results = pd.DataFrame(all_results)
+    results = results.sort_values("Similarity", ascending=False).drop_duplicates(subset=["Drug"]).head(top_k)
+    
     # Normalize drug names for merging
     results["Drug_normalized"] = results["Drug"].astype(str).str.strip().str.lower()
-
+    
     # Merge with CIViC evidence
     if not civic_df.empty and "drug" in civic_df.columns:
         civic_merge = civic_df.copy()
         civic_merge["drug_normalized"] = civic_merge["drug"].astype(str).str.strip().str.lower()
         
+        # Add line of therapy filtering if available in CIViC data
+        if "line_of_therapy" in civic_merge.columns:
+            civic_merge = civic_merge[
+                (civic_merge["line_of_therapy"] == line_of_therapy) | 
+                (civic_merge["line_of_therapy"].isna())
+            ]
+        
         civic_cols = ["drug_normalized"]
-        for col in ["evidence_level", "rationale_text", "source_url"]:
+        for col in ["evidence_level", "rationale_text", "source_url", "approval_status"]:
             if col in civic_merge.columns:
                 civic_cols.append(col)
         
@@ -107,12 +203,11 @@ def recommend_therapies(gene, variant, top_k=5):
         )
         results.drop(columns=["drug_normalized"], errors="ignore", inplace=True)
     
-    # Merge with DepMap data using CompoundName
+    # Merge with DepMap data
     if not depmap_df.empty and "CompoundName" in depmap_df.columns:
         depmap_merge = depmap_df.copy()
         depmap_merge["drug_normalized"] = depmap_merge["CompoundName"].astype(str).str.strip().str.lower()
         
-        # Include relevant DepMap columns
         depmap_cols = ["drug_normalized"]
         for col in ["GeneSymbolOfTargets", "TargetOrMechanism", "ChEMBLID"]:
             if col in depmap_merge.columns:
@@ -143,14 +238,46 @@ def recommend_therapies(gene, variant, top_k=5):
             right_on="drug_normalized"
         )
         results.drop(columns=["drug_normalized"], errors="ignore", inplace=True)
-
-    # Drop the normalized column used for merging
+    
+    # Determine on-label vs off-label
+    if "approval_status" in results.columns:
+        results["Label Status"] = results["approval_status"].apply(
+            lambda x: "✅ On-Label" if pd.notna(x) and "approved" in str(x).lower() else "⚠️ Off-Label"
+        )
+    elif "evidence_level" in results.columns:
+        results["Label Status"] = results["evidence_level"].apply(
+            lambda x: "✅ On-Label" if pd.notna(x) and str(x) in ["A", "B"] else "⚠️ Off-Label"
+        )
+    else:
+        results["Label Status"] = "⚠️ Off-Label"
+    
+    # Sort: on-label first, then by similarity
+    results["sort_key"] = results["Label Status"].apply(lambda x: 0 if "On-Label" in x else 1)
+    results = results.sort_values(["sort_key", "Similarity"], ascending=[True, False]).drop(columns=["sort_key"])
+    
+    # Generate LLM rationales if enabled
+    if use_llm_rationales and api_key:
+        st.info("🤖 Generating AI-powered clinical rationales...")
+        rationales = []
+        for _, row in results.iterrows():
+            rationale = generate_rationale(
+                drug=row["Drug"],
+                biomarkers=positive_biomarkers,
+                evidence_level=row.get("evidence_level", None),
+                mechanism=row.get("TargetOrMechanism", None),
+                targets=row.get("GeneSymbolOfTargets", None),
+                api_key=api_key
+            )
+            rationales.append(rationale if rationale else row.get("rationale_text", ""))
+        results["AI Rationale"] = rationales
+    
+    # Drop the normalized column
     results.drop(columns=["Drug_normalized"], errors="ignore", inplace=True)
-
-    # Rename columns to user-friendly names
+    
+    # Rename columns
     rename_map = {
         "evidence_level": "Evidence Level",
-        "rationale_text": "Rationale",
+        "rationale_text": "CIViC Rationale",
         "source_url": "Source",
         "GeneSymbolOfTargets": "Targets",
         "TargetOrMechanism": "Mechanism",
@@ -160,11 +287,20 @@ def recommend_therapies(gene, variant, top_k=5):
     }
     
     results.rename(columns={k: v for k, v in rename_map.items() if k in results.columns}, inplace=True)
-
+    
     return results
 
+def recommend_therapies_simple(gene, variant, top_k=5, api_key=None, use_llm_rationales=False):
+    """Simple mode: just gene and variant"""
+    patient_profile = {
+        "diagnosis": "NSCLC",
+        "line_of_therapy": "1L",
+        "biomarkers": {gene: variant}
+    }
+    return recommend_therapies_clinical(patient_profile, top_k, api_key, use_llm_rationales)
+
 # ============================================================
-# 3️⃣  STREAMLIT UI
+# 4️⃣  STREAMLIT UI
 # ============================================================
 
 st.title("🧬 TherapyMatcher — Precision Oncology Recommender")
@@ -173,58 +309,166 @@ Use biological embeddings + CIViC evidence + DepMap drug sensitivity to identify
 for specific **gene variants** in lung and related cancers.
 """)
 
-col1, col2 = st.columns(2)
-gene = col1.text_input("Gene symbol", "EGFR")
-variant = col2.text_input("Variant", "L858R")
-top_k = st.slider("Top therapies to display", 3, 10, 5)
+# Input mode selector
+input_mode = st.radio(
+    "Select Input Mode",
+    ["🔹 Simple (Gene + Variant)", "🔸 Clinical Profile (JSON)"],
+    help="Simple mode for quick queries, Clinical Profile for comprehensive patient data"
+)
 
-if st.button("🔍 Recommend Therapies"):
-    with st.spinner("Analyzing embeddings and evidence..."):
-        results = recommend_therapies(gene, variant, top_k)
+if input_mode == "🔹 Simple (Gene + Variant)":
+    col1, col2 = st.columns(2)
+    gene = col1.text_input("Gene symbol", "EGFR")
+    variant = col2.text_input("Variant", "L858R")
+    top_k = st.slider("Top therapies to display", 3, 10, 5)
     
-    if results is not None and not results.empty:
-        st.success(f"✅ Recommendations for {gene}_{variant}")
+    if st.button("🔍 Recommend Therapies"):
+        with st.spinner("Analyzing embeddings and evidence..."):
+            results = recommend_therapies_simple(gene, variant, top_k, openai_api_key, use_llm)
         
-        # Display results with better formatting
-        st.dataframe(
-            results,
-            use_container_width=True,
-            column_config={
-                "Drug": st.column_config.TextColumn("Drug", width="medium"),
-                "Similarity": st.column_config.NumberColumn("Similarity", format="%.3f"),
-                "Evidence Level": st.column_config.TextColumn("Evidence Level", width="small"),
-                "Targets": st.column_config.TextColumn("Targets", width="large"),
-                "Mechanism": st.column_config.TextColumn("Mechanism", width="medium"),
-                "Source": st.column_config.LinkColumn("Source", width="small"),
-            }
-        )
+        if results is not None and not results.empty:
+            st.success(f"✅ Recommendations for {gene}_{variant}")
+            display_results(results, f"{gene}_{variant}")
+        else:
+            st.error("❌ No matching drugs found for this variant.")
 
-        # CSV Download
-        csv = results.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Results as CSV",
-            csv,
-            f"{gene}_{variant}_recommendations.csv",
-            "text/csv",
-            key="download-csv"
-        )
+else:  # Clinical Profile JSON mode
+    st.markdown("### 📋 Patient Clinical Profile")
+    
+    default_json = """{
+  "diagnosis": "Metastatic NSCLC",
+  "line_of_therapy": "1L",
+  "biomarkers": {
+    "EGFR": "L858R",
+    "ALK": false,
+    "KRAS": "G12C",
+    "PD-L1": ">=50%"
+  },
+  "comorbidities": ["no interstitial lung disease"],
+  "prior_therapies": []
+}"""
+    
+    json_input = st.text_area(
+        "Paste patient profile (JSON format)",
+        value=default_json,
+        height=250,
+        help="Enter patient biomarkers, diagnosis, line of therapy, and clinical context"
+    )
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        top_k_json = st.slider("Top therapies to display", 3, 15, 6, key="json_slider")
+    
+    if st.button("🔍 Match Therapies", key="json_match"):
+        try:
+            patient_profile = json.loads(json_input)
+            
+            # Display parsed profile
+            with st.expander("📊 Parsed Patient Profile"):
+                st.json(patient_profile)
+            
+            with st.spinner("Analyzing clinical profile and generating recommendations..."):
+                results = recommend_therapies_clinical(
+                    patient_profile, 
+                    top_k_json, 
+                    openai_api_key, 
+                    use_llm
+                )
+            
+            if results is not None and not results.empty:
+                diagnosis = patient_profile.get("diagnosis", "Patient")
+                line = patient_profile.get("line_of_therapy", "")
+                st.success(f"✅ Recommendations for {diagnosis} ({line})")
+                
+                # Display biomarker summary
+                biomarkers = patient_profile.get("biomarkers", {})
+                positive = [f"{k}: {v}" for k, v in biomarkers.items() if v and v != "false" and v != False]
+                st.info(f"🧬 **Actionable Biomarkers:** {', '.join(positive)}")
+                
+                display_results(results, f"{diagnosis}_{line}")
+            else:
+                st.error("❌ No matching therapies found for this profile.")
         
-        # Display summary statistics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Drugs Found", len(results))
-        with col2:
-            avg_sim = results["Similarity"].mean()
-            st.metric("Avg Similarity", f"{avg_sim:.3f}")
-        with col3:
-            if "Evidence Level" in results.columns:
-                evidence_count = results["Evidence Level"].notna().sum()
-                st.metric("With CIViC Evidence", evidence_count)
-    else:
-        st.error("❌ No matching drugs found for this variant.")
+        except json.JSONDecodeError as e:
+            st.error(f"❌ Invalid JSON format: {e}")
+        except Exception as e:
+            st.error(f"❌ Error processing profile: {e}")
 
 # ============================================================
-# 4️⃣  EMBEDDING VISUALIZATION
+# 5️⃣  RESULTS DISPLAY FUNCTION
+# ============================================================
+
+def display_results(results, query_name):
+    """Display results with enhanced formatting"""
+    
+    # Reorder columns for better display
+    display_cols = ["Label Status", "Drug", "Similarity", "Biomarker"]
+    if "Evidence Level" in results.columns:
+        display_cols.append("Evidence Level")
+    if "AI Rationale" in results.columns:
+        display_cols.append("AI Rationale")
+    elif "CIViC Rationale" in results.columns:
+        display_cols.append("CIViC Rationale")
+    if "Mechanism" in results.columns:
+        display_cols.append("Mechanism")
+    if "Targets" in results.columns:
+        display_cols.append("Targets")
+    if "Cardiotoxicity" in results.columns:
+        display_cols.append("Cardiotoxicity")
+    if "Dermatotoxicity" in results.columns:
+        display_cols.append("Dermatotoxicity")
+    if "Source" in results.columns:
+        display_cols.append("Source")
+    
+    # Filter to only existing columns
+    display_cols = [col for col in display_cols if col in results.columns]
+    results_display = results[display_cols]
+    
+    # Display with custom column config
+    st.dataframe(
+        results_display,
+        use_container_width=True,
+        column_config={
+            "Label Status": st.column_config.TextColumn("Status", width="small"),
+            "Drug": st.column_config.TextColumn("Drug", width="medium"),
+            "Similarity": st.column_config.NumberColumn("Similarity", format="%.3f", width="small"),
+            "Evidence Level": st.column_config.TextColumn("Evidence", width="small"),
+            "AI Rationale": st.column_config.TextColumn("AI-Generated Rationale", width="large"),
+            "CIViC Rationale": st.column_config.TextColumn("Clinical Rationale", width="large"),
+            "Targets": st.column_config.TextColumn("Targets", width="medium"),
+            "Mechanism": st.column_config.TextColumn("Mechanism", width="medium"),
+            "Source": st.column_config.LinkColumn("Source", width="small"),
+        },
+        hide_index=True
+    )
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Drugs Found", len(results))
+    with col2:
+        avg_sim = results["Similarity"].mean()
+        st.metric("Avg Similarity", f"{avg_sim:.3f}")
+    with col3:
+        on_label = len(results[results["Label Status"].str.contains("On-Label", na=False)])
+        st.metric("On-Label Options", on_label)
+    with col4:
+        if "Evidence Level" in results.columns:
+            high_evidence = len(results[results["Evidence Level"].isin(["A", "B"])])
+            st.metric("High Evidence", high_evidence)
+    
+    # CSV Download
+    csv = results.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download Results as CSV",
+        csv,
+        f"{query_name}_recommendations.csv",
+        "text/csv",
+        key=f"download-{query_name}"
+    )
+
+# ============================================================
+# 6️⃣  EMBEDDING VISUALIZATION
 # ============================================================
 
 st.markdown("---")
@@ -270,34 +514,7 @@ except Exception as e:
     st.error(f"❌ Could not generate embedding plot: {e}")
 
 # ============================================================
-# 5️⃣  FOOTER
-# ============================================================
-
-st.markdown("---")
-st.caption("🔬 Powered by CIViC • DepMap • Node2Vec • Streamlit • FDA Toxicity Data")
-
-with st.expander("📖 About TherapyMatcher"):
-    st.markdown("""
-    **TherapyMatcher** leverages graph neural networks to recommend precision oncology therapies based on:
-    
-    - **CIViC**: Clinical interpretations of variants in cancer
-    - **DepMap**: Drug sensitivity and target mechanism data
-    - **FDA**: Toxicity profiles for safety assessment
-    - **Node2Vec**: Graph embeddings capturing biological relationships
-    
-    **How it works:**
-    1. Enter a gene and variant (e.g., EGFR L858R)
-    2. The system computes similarity between the variant and all known drugs
-    3. Results are ranked by embedding similarity and enriched with clinical evidence
-    
-    **Limitations:**
-    - Recommendations are computational predictions, not clinical advice
-    - Always validate with current literature and clinical guidelines
-    - Drug approvals and evidence levels may have changed since data collection
-    """)
-
-# ============================================================
-# 6️⃣  OPTIONAL: BATCH QUERY
+# 7️⃣  BATCH QUERY
 # ============================================================
 
 st.markdown("---")
@@ -321,7 +538,7 @@ with st.expander("Run batch analysis"):
             parts = variant_line.split()
             if len(parts) >= 2:
                 g, v = parts[0], parts[1]
-                res = recommend_therapies(g, v, batch_top_k)
+                res = recommend_therapies_simple(g, v, batch_top_k, openai_api_key, False)  # Disable LLM for batch
                 if res is not None and not res.empty:
                     res["Query"] = f"{g}_{v}"
                     batch_results.append(res)
@@ -344,3 +561,43 @@ with st.expander("Run batch analysis"):
             )
         else:
             st.warning("No results found for any variants")
+
+# ============================================================
+# 8️⃣  FOOTER
+# ============================================================
+
+st.markdown("---")
+st.caption("🔬 Powered by CIViC • DepMap • Node2Vec • Streamlit • FDA Toxicity Data • OpenAI GPT-4")
+
+with st.expander("📖 About TherapyMatcher"):
+    st.markdown("""
+    **TherapyMatcher** leverages graph neural networks and clinical evidence to recommend precision oncology therapies.
+    
+    **Data Sources:**
+    - **CIViC**: Clinical interpretations of variants in cancer
+    - **DepMap**: Drug sensitivity and target mechanism data
+    - **FDA**: Toxicity profiles for safety assessment
+    - **Node2Vec**: Graph embeddings capturing biological relationships
+    
+    **Features:**
+    - ✅ Simple gene+variant queries or comprehensive JSON patient profiles
+    - ✅ On-label vs off-label therapy identification
+    - ✅ Evidence-level stratification (A/B = high confidence)
+    - ✅ Optional AI-generated clinical rationales (GPT-4)
+    - ✅ Multi-biomarker support for complex cases
+    - ✅ Toxicity assessment (cardio, dermatological)
+    
+    **How it works:**
+    1. Enter patient biomarkers (simple or JSON format)
+    2. System computes similarity in embedding space
+    3. Results ranked by evidence + similarity
+    4. Optional: GPT-4 generates clinical explanations
+    
+    **Limitations:**
+    - Computational predictions, not clinical advice
+    - Validate with current literature and guidelines
+    - Evidence may have changed since data collection
+    - Requires OpenAI API key for LLM rationales
+    
+    **Developed for:** Evolved Boston 2025 Hackathon | Team 14: AI for Precision Medicine
+    """)
