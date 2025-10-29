@@ -31,10 +31,22 @@ if not all([emb_file, civic_file, depmap_file, fda_file]):
 # LOAD DATA
 # ---------------------------
 @st.cache_data
-def load_embeddings(file):
-    df = pd.read_csv(file)
-    df.set_index("node", inplace=True)
+def load_embeddings(file_path):
+    """Load embeddings CSV, handle both index-based and column-based versions."""
+    df = pd.read_csv(file_path)
+    
+    # Check if there's a column named 'node'
+    if "node" in df.columns:
+        df.set_index("node", inplace=True)
+    else:
+        # If not, assume the first column is the node index
+        df.set_index(df.columns[0], inplace=True)
+    
+    # Ensure the index has a consistent name
+    df.index.name = "node"
+    
     return df
+
 
 @st.cache_data
 def load_csv(file):
