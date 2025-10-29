@@ -1,98 +1,142 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
 from sklearn.metrics.pairwise import cosine_similarity
 
-st.set_page_config(page_title="Therapy Matcher", page_icon="🧬", layout="wide")
+# ---------------------------
+# PAGE SETUP
+# ---------------------------
+st.set_page_config(page_title="Precision Oncology Therapy Recommender", layout="wide", page_icon="🧬")
+st.title("🧬 Precision & Safety-Aware Oncology Therapy Recommender")
+st.markdown("Upload graph, knowledge, sensitivity, and FDA safety data to recommend therapies for a given gene–variant pair.")
 
-# ============================================================
-# 1️⃣ Load Data
-# ============================================================
-@st.cache_data
-def load_all():
-    civic = pd.read_csv("civic_lung_therapy_map.csv")
-    emb_df = pd.read_csv("graph_embeddings.csv", index_col=0)
-    depmap = pd.read_csv("depmap_drug_sensitivity.csv")
-    fda = pd.read_csv("fda_drugs.csv")
-    approved = set(fda["drug_name"].str.title())
-    return civic, emb_df, depmap, approved
-
-civic, emb_df, depmap, approved = load_all()
-
-st.sidebar.success(f"✅ Loaded {len(emb_df)} embeddings")
-
-# ============================================================
-# 2️⃣ Build lookup functions
-# ============================================================
-import networkx as nx
-G = nx.MultiDiGraph()
-for _, r in civic.iterrows():
-    gene = r["gene"].upper()
-    variant = f"{r['gene'].upper()}_{r['variant']}"
-    drug = r["drug"].title()
-    disease = r["disease"].title()
-    G.add_node(gene, type="gene")
-    G.add_node(variant, type="variant")
-    G.add_node(drug, type="drug")
-    G.add_node(disease, type="disease")
-    G.add_edge(variant, drug, relation="treated_by",
-               evidence=r["evidence_level"],
-               rationale=r["rationale_text"],
-               source=r["source_url"])
-
-# ============================================================
-# 3️⃣ Recommendation Function
-# ============================================================
-def recommend_therapies(gene, variant, top_k=5):
-    node = f"{gene.upper()}_{variant}"
-    if node not in emb_df.index:
-        st.warning(f"{node} not in embeddings.")
-        return pd.DataFrame()
-
-    v = emb_df.loc[node].values.reshape(1, -1)
-    drug_nodes = [n for n, d in G.nodes(data=True) if d["type"] == "drug"]
-    sims = cosine_similarity(v, emb_df.loc[drug_nodes])[0]
-    idx = np.argsort(sims)[::-1][:top_k]
-
-    df = pd.DataFrame({"Drug": [drug_nodes[i] for i in idx],
-                       "Similarity": sims[idx].round(3)})
-    df = df.merge(depmap, left_on="Drug", right_on="drug_name", how="left")
-    df["Approval_Status"] = df["Drug"].apply(
-        lambda x: "FDA-approved" if x in approved else "Experimental"
-    )
-
-    results = []
-    for _, r in df.iterrows():
-        rationale, level, source = "–", "NA", "–"
-        if G.has_edge(node, r["Drug"]):
-            e = list(G.get_edge_data(node, r["Drug"]).values())[0]
-            rationale = e.get("rationale", "–")[:160] + "…"
-            level = e.get("evidence", "NA")
-            source = e.get("source", "–")
-        results.append((r["Drug"], r["Similarity"], r["Approval_Status"],
-                        level, rationale, source))
-    return pd.DataFrame(results,
-        columns=["Drug", "Similarity", "Approval_Status", "Evidence", "Rationale", "Source"])
-
-# ============================================================
-# 4️⃣ Streamlit UI
-# ============================================================
-st.title("🧬 Precision Oncology Therapy Matcher")
-st.write("Discover potential targeted therapies based on gene–variant profiles using CIViC knowledge graph embeddings.")
+# ---------------------------
+# FILE UPLOADS
+# ---------------------------
+st.header("1️⃣ Upload Required Files")
 
 col1, col2 = st.columns(2)
-gene = col1.text_input("Gene Symbol", "EGFR")
-variant = col2.text_input("Variant", "L858R")
-top_k = st.slider("Number of therapies to show", 3, 10, 5)
+with col1:
+    emb_file = st.file_uploader("Graph Embeddings (CSV)", type="csv")
+    civic_file = st.file_uploader("CIViC Therapy Map (CSV)", type="csv")
+with col2:
+    depmap_file = st.file_uploader("DepMap Drug Sensitivity (CSV)", type="csv")
+    fda_file = st.file_uploader("FDA / UniTox Safety File (CSV/XLSX)", type=["csv", "xlsx"])
 
-if st.button("🔎 Recommend Therapies"):
-    with st.spinner("Analyzing..."):
-        out = recommend_therapies(gene, variant, top_k)
-        if not out.empty:
-            st.success(f"Results for {gene}_{variant}")
-            st.dataframe(out, use_container_width=True)
-            csv = out.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download CSV", csv, f"{gene}_{variant}_recommendations.csv", "text/csv")
-        else:
-            st.error("No matches found.")
+if not all([emb_file, civic_file, depmap_file, fda_file]):
+    st.info("Please upload all four files above to continue.")
+    st.stop()
+
+# ---------------------------
+# LOAD DATA
+# ---------------------------
+@st.cache_data
+def load_embeddings(file):
+    df = pd.read_csv(file)
+    df.set_index("node", inplace=True)
+    return df
+
+@st.cache_data
+def load_csv(file):
+    return pd.read_csv(file)
+
+@st.cache_data
+def load_fda(file):
+    if file.name.endswith(".xlsx"):
+        df = pd.read_excel(file)
+    else:
+        df = pd.read_csv(file)
+    df = df.rename(columns={
+        "Generic Name": "drug",
+        "Cardiotoxicity Binary Rating": "cardiotoxic",
+        "Dermatotoxicity Binary Rating": "dermatotoxic"
+    })
+    return df[["drug", "cardiotoxic", "dermatotoxic"]].drop_duplicates()
+
+graph_df = load_embeddings(emb_file)
+civic_df = load_csv(civic_file)
+depmap_df = load_csv(depmap_file)
+fda_df = load_fda(fda_file)
+
+# ---------------------------
+# USER INPUTS
+# ---------------------------
+st.header("2️⃣ Query Parameters")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    gene = st.text_input("Gene", value="BRAF")
+with col2:
+    variant = st.text_input("Variant", value="V600E")
+with col3:
+    top_n = st.number_input("Number of Recommendations", 1, 10, 5)
+
+query_node = f"{gene}_{variant}"
+
+# ---------------------------
+# RECOMMENDATION ENGINE
+# ---------------------------
+if st.button("🔍 Recommend Therapies"):
+    if query_node not in graph_df.index:
+        st.error(f"❌ Variant `{query_node}` not found in embeddings.")
+        st.stop()
+
+    # Compute similarities
+    query_emb = graph_df.loc[[query_node]].values
+    drug_nodes = [n for n in graph_df.index if n.startswith("DRUG_")]
+    drug_embs = graph_df.loc[drug_nodes].values
+    similarities = cosine_similarity(query_emb, drug_embs)[0]
+
+    rec_df = pd.DataFrame({
+        "drug": [d.replace("DRUG_", "") for d in drug_nodes],
+        "similarity": similarities
+    }).sort_values("similarity", ascending=False).head(top_n)
+
+    # ---------------------------
+    # MERGE CIVIC KNOWLEDGE GRAPH
+    # ---------------------------
+    civic_merge = civic_df[["gene", "variant", "drug", "evidence_level", "rationale"]].drop_duplicates()
+    civic_merge = civic_merge.rename(columns={"evidence_level": "evidence"})
+    rec_df = rec_df.merge(civic_merge, on="drug", how="left")
+
+    # ---------------------------
+    # MERGE DEPMAP DRUG SENSITIVITY
+    # ---------------------------
+    if "Drug" in depmap_df.columns:
+        depmap_df = depmap_df.rename(columns={"Drug": "drug"})
+    if "IC50" in depmap_df.columns:
+        depmap_df["IC50"] = depmap_df["IC50"].astype(float)
+    rec_df = rec_df.merge(depmap_df[["drug", "IC50"]].drop_duplicates(), on="drug", how="left")
+
+    # ---------------------------
+    # MERGE FDA SAFETY FLAGS
+    # ---------------------------
+    rec_df = rec_df.merge(fda_df, on="drug", how="left")
+    rec_df["cardiotoxic"] = rec_df["cardiotoxic"].fillna("NA")
+    rec_df["dermatotoxic"] = rec_df["dermatotoxic"].fillna("NA")
+    rec_df["similarity"] = rec_df["similarity"].round(3)
+
+    # ---------------------------
+    # DISPLAY RESULTS
+    # ---------------------------
+    st.subheader("📊 Top Therapy Recommendations")
+    st.dataframe(rec_df, use_container_width=True)
+
+    # Download
+    csv = rec_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download CSV", data=csv,
+                       file_name=f"therapy_recommendations_{gene}_{variant}.csv", mime="text/csv")
+
+    # ---------------------------
+    # INTERPRETATION
+    # ---------------------------
+    st.markdown("""
+    ---
+    ### 🧠 How It Works
+    1. Finds embedding-space neighbors to your input variant (`graph_embeddings.csv`).
+    2. Links drugs via **CIViC knowledge graph** relationships (`civic_lung_therapy_map.csv`).
+    3. Integrates **DepMap IC50 sensitivity** as a pharmacologic confidence metric.
+    4. Adds **FDA toxicity** signals for safety-aware prioritization.
+    """)
+
+    st.success(f"✅ Generated {len(rec_df)} ranked therapy recommendations for **{gene}_{variant}**.")
