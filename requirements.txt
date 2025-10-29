@@ -1,21 +1,15 @@
-# Core framework
+# ---- Core ----
 streamlit==1.39.0
 
-# Data manipulation
-pandas==2.2.3
+# ---- Data Science ----
 numpy==1.26.4
-
-# Machine learning utilities
+pandas==2.2.3
 scikit-learn==1.5.2
 
-# Visualization
+# ---- Visualization ----
 matplotlib==3.9.2
 seaborn==0.13.2
 
-# Graph & embeddings (optional but recommended)
+# ---- Optional but safe ----
 networkx==3.3
-torch==2.3.1
-torch-geometric==2.5.3
-
-# Optional utils (safe to include for robustness)
 requests==2.32.3
