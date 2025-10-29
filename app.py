@@ -46,6 +46,7 @@ def load_all_data():
         for col in ["drug", "ic50", "dermatotoxic", "hepatotoxic", "cardiotoxic", "nephrotoxic"]:
             if col not in df.columns:
                 df[col] = np.nan
+    
     return emb_df, civic_df, depmap_df, fda_df
 
 
@@ -69,6 +70,11 @@ def recommend_therapies(gene, variant, top_k=5):
     # Compute cosine similarity between variant node and all drug nodes
     v = emb_df.loc[node].values.reshape(1, -1)
     drug_nodes = [n for n in emb_df.index if any(x in n.lower() for x in ["ib", "inib", "mab", "nib", "tib", "raf", "met", "tinib"])]
+    
+    if len(drug_nodes) == 0:
+        st.warning("No drug nodes found in embeddings.")
+        return None
+    
     drug_vectors = emb_df.loc[drug_nodes]
     sims = cosine_similarity(v, drug_vectors)[0]
     top_idx = np.argsort(sims)[::-1][:top_k]
@@ -79,26 +85,47 @@ def recommend_therapies(gene, variant, top_k=5):
     })
 
     # Merge with CIViC evidence, toxicity & IC50
-    results = results.merge(civic_df[["drug", "evidence_level", "rationale_text", "source_url"]],
-                            how="left", left_on="Drug", right_on="drug").drop(columns=["drug"])
-    results = results.merge(depmap_df[["drug", "ic50"]], how="left", left_on="Drug", right_on="drug").drop(columns=["drug"])
+    if not civic_df.empty and "drug" in civic_df.columns:
+        civic_cols = [c for c in ["drug", "evidence_level", "rationale_text", "source_url"] if c in civic_df.columns]
+        results = results.merge(civic_df[civic_cols], how="left", left_on="Drug", right_on="drug")
+        if "drug" in results.columns:
+            results.drop(columns=["drug"], inplace=True)
+    
+    if not depmap_df.empty and "drug" in depmap_df.columns and "ic50" in depmap_df.columns:
+        results = results.merge(depmap_df[["drug", "ic50"]], how="left", left_on="Drug", right_on="drug")
+        if "drug" in results.columns:
+            results.drop(columns=["drug"], inplace=True)
+    
     # --- FDA Toxicity Merge ---
-fda_df["Generic Name"] = fda_df["Generic Name"].astype(str).str.strip()
-results["Drug"] = results["Drug"].astype(str).str.strip()
+    if not fda_df.empty and "Generic Name" in fda_df.columns:
+        fda_df["Generic Name"] = fda_df["Generic Name"].astype(str).str.strip().str.lower()
+        results["Drug_lower"] = results["Drug"].astype(str).str.strip().str.lower()
+        
+        fda_cols = ["Generic Name"]
+        for col in ["Cardiotoxicity Binary Rating", "DermatologicalToxicity Binary Rating"]:
+            if col in fda_df.columns:
+                fda_cols.append(col)
+        
+        results = results.merge(
+            fda_df[fda_cols],
+            how="left",
+            left_on="Drug_lower",
+            right_on="Generic Name"
+        )
+        results.drop(columns=["Generic Name", "Drug_lower"], errors="ignore", inplace=True)
+        
+        # Rename toxicity columns
+        rename_dict = {}
+        if "Cardiotoxicity Binary Rating" in results.columns:
+            rename_dict["Cardiotoxicity Binary Rating"] = "Cardiotoxicity"
+        if "DermatologicalToxicity Binary Rating" in results.columns:
+            rename_dict["DermatologicalToxicity Binary Rating"] = "Dermatotoxicity"
+        
+        if rename_dict:
+            results.rename(columns=rename_dict, inplace=True)
 
-results = results.merge(
-    fda_df[["Generic Name", "Cardiotoxicity Binary Rating", "DermatologicalToxicity Binary Rating"]],
-    how="left",
-    left_on="Drug",
-    right_on="Generic Name"
-).drop(columns=["Generic Name"], errors="ignore")
-
-results.rename(columns={
-    "Cardiotoxicity Binary Rating": "Cardiotoxicity",
-    "DermatologicalToxicity Binary Rating": "Dermatotoxicity"
-}, inplace=True)
-
-    results.rename(columns={
+    # Final column renaming
+    rename_map = {
         "evidence_level": "Evidence Level",
         "rationale_text": "Rationale",
         "source_url": "Source",
@@ -107,7 +134,8 @@ results.rename(columns={
         "hepatotoxic": "Liver Toxicity",
         "cardiotoxic": "Cardiac Toxicity",
         "nephrotoxic": "Renal Toxicity"
-    }, inplace=True)
+    }
+    results.rename(columns={k: v for k, v in rename_map.items() if k in results.columns}, inplace=True)
 
     return results
 
@@ -146,16 +174,19 @@ st.markdown("---")
 st.subheader("📊 Node Embedding Map (PCA projection)")
 
 try:
-    coords = PCA(n_components=2).fit_transform(emb_df.values)
-    df_plot = pd.DataFrame(coords, columns=["PC1", "PC2"])
-    df_plot["Type"] = ["drug" if "ib" in n.lower() or "mab" in n.lower() else "gene/variant" for n in emb_df.index]
+    if not emb_df.empty and len(emb_df) > 2:
+        coords = PCA(n_components=2).fit_transform(emb_df.values)
+        df_plot = pd.DataFrame(coords, columns=["PC1", "PC2"])
+        df_plot["Type"] = ["drug" if "ib" in n.lower() or "mab" in n.lower() else "gene/variant" for n in emb_df.index]
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.scatterplot(data=df_plot, x="PC1", y="PC2", hue="Type",
-                    palette={"drug": "#1f77b4", "gene/variant": "#ff7f0e"},
-                    s=30, alpha=0.75)
-    ax.set_title("Node2Vec Embedding Map (CIViC + DepMap Fusion)")
-    st.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.scatterplot(data=df_plot, x="PC1", y="PC2", hue="Type",
+                        palette={"drug": "#1f77b4", "gene/variant": "#ff7f0e"},
+                        s=30, alpha=0.75, ax=ax)
+        ax.set_title("Node2Vec Embedding Map (CIViC + DepMap Fusion)")
+        st.pyplot(fig)
+    else:
+        st.warning("Not enough embeddings to visualize.")
 except Exception as e:
     st.warning(f"Could not generate embedding plot: {e}")
 
