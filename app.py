@@ -82,8 +82,21 @@ def recommend_therapies(gene, variant, top_k=5):
     results = results.merge(civic_df[["drug", "evidence_level", "rationale_text", "source_url"]],
                             how="left", left_on="Drug", right_on="drug").drop(columns=["drug"])
     results = results.merge(depmap_df[["drug", "ic50"]], how="left", left_on="Drug", right_on="drug").drop(columns=["drug"])
-    results = results.merge(fda_df[["drug", "dermatotoxic", "hepatotoxic", "cardiotoxic", "nephrotoxic"]],
-                            how="left", left_on="Drug", right_on="drug").drop(columns=["drug"])
+    # --- FDA Toxicity Merge ---
+fda_df["Generic Name"] = fda_df["Generic Name"].astype(str).str.strip()
+results["Drug"] = results["Drug"].astype(str).str.strip()
+
+results = results.merge(
+    fda_df[["Generic Name", "Cardiotoxicity Binary Rating", "DermatologicalToxicity Binary Rating"]],
+    how="left",
+    left_on="Drug",
+    right_on="Generic Name"
+).drop(columns=["Generic Name"], errors="ignore")
+
+results.rename(columns={
+    "Cardiotoxicity Binary Rating": "Cardiotoxicity",
+    "DermatologicalToxicity Binary Rating": "Dermatotoxicity"
+}, inplace=True)
 
     results.rename(columns={
         "evidence_level": "Evidence Level",
